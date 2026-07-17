@@ -5,6 +5,7 @@ import re
 import ast
 import operator
 import logging
+import time
 
 import torch
 from ddgs import DDGS
@@ -12,6 +13,18 @@ from transformers import pipeline
 from rapidfuzz import process, fuzz
 
 logger = logging.getLogger("qna.core")
+
+SEARCH_REGION = "in-en"
+SEARCH_BACKEND = "lite"
+SEARCH_OPTIONS = (
+    (SEARCH_REGION, SEARCH_BACKEND),
+    ("wt-wt", SEARCH_BACKEND),
+    ("us-en", SEARCH_BACKEND),
+)
+SEARCH_ATTEMPTS = 2
+SEARCH_TARGET_RESULTS = 6
+SEARCH_RESULTS_PER_QUERY = 5
+MIN_RELEVANT_TERM_MATCHES = 2
 
 # ============================================================
 # Model Initialization
@@ -58,8 +71,19 @@ def solve_math(expr: str) -> str:
 def is_yes_no_claim(q: str) -> bool:
     return q.lower().startswith(("is ", "are ", "was ", "were ", "do ", "does "))
 
+def expects_winner(q: str) -> bool:
+    return q.lower().strip().startswith("who won ")
+
 def expects_person(q: str) -> bool:
-    return q.lower().startswith("who ")
+    q = q.lower().strip()
+    if not q.startswith("who "):
+        return False
+
+    # "Who won/owns/makes..." can validly resolve to a team, country, or
+    # organization. Enforce person-shaped answers only for role/identity forms.
+    if detect_role(q):
+        return True
+    return bool(re.match(r"^who\s+(is|was|are|were)\b", q))
 
 # ============================================================
 # Text Cleaning (fixes glued-word artifacts from scraped snippets)
@@ -99,6 +123,76 @@ def smart_truncate(text: str, limit: int) -> str:
     if last_space > 0:
         truncated = truncated[:last_space]
     return truncated.rstrip(" ,;:-") + "..."
+
+# ============================================================
+# Search Query Rewriting & Relevance
+# ============================================================
+_QUESTION_MARK = re.compile(r"\?+$")
+_STOP_TERMS = {
+    "a", "an", "and", "are", "as", "at", "by", "current", "definition",
+    "did", "do", "does", "for", "from", "how", "in", "is", "of", "on",
+    "or", "the", "to", "was", "were", "what", "when", "where", "which",
+    "who", "why", "won",
+}
+
+def _clean_query_text(query: str) -> str:
+    return _QUESTION_MARK.sub("", query).strip()
+
+def _strip_leading_article(text: str) -> str:
+    return re.sub(r"^(?:a|an|the)\s+", "", text.strip(), flags=re.IGNORECASE)
+
+def _add_unique(values: list[str], value: str) -> None:
+    value = re.sub(r"\s+", " ", value).strip()
+    if value and value.lower() not in {v.lower() for v in values}:
+        values.append(value)
+
+def build_search_queries(query: str) -> list[str]:
+    cleaned = _clean_query_text(query)
+    q = cleaned.lower()
+    queries: list[str] = []
+
+    capital_match = re.match(r"what\s+is\s+the\s+capital\s+of\s+(.+)$", q)
+    if capital_match:
+        place = cleaned[capital_match.start(1):].strip()
+        _add_unique(queries, f"{place} capital city")
+        _add_unique(queries, f"capital city of {place}")
+
+    won_match = re.match(r"who\s+won\s+(?:the\s+)?(.+)$", q)
+    if won_match:
+        event = cleaned[won_match.start(1):].strip()
+        _add_unique(queries, f"{event} winner")
+
+    identity_match = re.match(r"who\s+(?:is|was|are|were)\s+(.+)$", q)
+    if identity_match:
+        subject = _strip_leading_article(cleaned[identity_match.start(1):])
+        if any(role in q for role in ("prime minister", "chief minister", "governor", "president")):
+            _add_unique(queries, f"current {subject}")
+        _add_unique(queries, subject)
+
+    definition_match = re.match(r"what\s+(?:is|are)\s+(?:a\s+|an\s+|the\s+)?(.+)$", q)
+    if definition_match and not capital_match:
+        subject = _strip_leading_article(cleaned[definition_match.start(1):])
+        _add_unique(queries, f"{subject} definition")
+
+    _add_unique(queries, cleaned)
+    return queries
+
+def _keyword_terms(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", text.lower())
+        if len(token) > 1 and token not in _STOP_TERMS
+    }
+
+def is_relevant_result(query: str, search_query: str, context: str) -> bool:
+    terms = _keyword_terms(search_query) or _keyword_terms(query)
+    if not terms:
+        return True
+
+    haystack = context.lower()
+    matches = sum(1 for term in terms if re.search(rf"\b{re.escape(term)}\b", haystack))
+    required = min(MIN_RELEVANT_TERM_MATCHES, len(terms))
+    return matches >= required
 
 # ============================================================
 # Role Detection & Explanation
@@ -148,6 +242,29 @@ GENERIC_ROLES = {"chief minister", "prime minister", "president", "governor", "p
 def is_generic_role_answer(answer: str, person_expected: bool) -> bool:
     return person_expected and answer.lower().strip() in GENERIC_ROLES
 
+def is_matchup_answer(answer: str) -> bool:
+    return bool(re.search(r"\b(?:v|vs|versus)\.?\b", answer.lower()))
+
+def is_truncated_answer(answer: str) -> bool:
+    return "..." in answer or "…" in answer
+
+def has_winner_evidence(answer: str, context: str) -> bool:
+    answer_pattern = re.escape(answer.lower())
+    for sentence in re.split(r"(?<=[.!?])\s+", context.lower()):
+        if answer.lower() not in sentence:
+            continue
+        if re.search(
+            rf"{answer_pattern}.{{0,100}}\b(won|wins|winner|winners|champion|champions|title|defeated|beat)\b",
+            sentence,
+        ):
+            return True
+        if re.search(
+            rf"\b(winner|winners|champion|champions)\b.{{0,100}}{answer_pattern}",
+            sentence,
+        ):
+            return True
+    return False
+
 def looks_like_person(name: str) -> bool:
     words = name.split()
     return len(words) >= 2 and sum(w[0].isupper() for w in words if w) >= 2
@@ -186,7 +303,15 @@ def fuzzy_consensus(predictions):
         else:
             clusters[p["answer"]] = [p]
 
-    best_key = max(clusters, key=lambda k: len(clusters[k]))
+    def cluster_rank(key):
+        cluster = clusters[key]
+        return (
+            len(cluster),
+            sum(p["score"] for p in cluster) / len(cluster),
+            max(p["score"] for p in cluster),
+        )
+
+    best_key = max(clusters, key=cluster_rank)
     cluster = clusters[best_key]
     best = max(cluster, key=lambda x: x["score"])
 
@@ -201,36 +326,92 @@ def fuzzy_consensus(predictions):
 # ============================================================
 # Web QA
 # ============================================================
+def search_web(query: str, max_results: int, timeout: int):
+    seen = set()
+    results = []
+    target_results = min(max_results, SEARCH_TARGET_RESULTS)
+    request_size = min(max_results, SEARCH_RESULTS_PER_QUERY)
+
+    for search_query in build_search_queries(query):
+        for region, backend in SEARCH_OPTIONS:
+            for attempt in range(SEARCH_ATTEMPTS):
+                try:
+                    with DDGS(timeout=timeout) as ddgs:
+                        batch = list(ddgs.text(
+                            search_query,
+                            region=region,
+                            safesearch="Off",
+                            backend=backend,
+                            max_results=request_size
+                        ))
+                except Exception:
+                    logger.exception(
+                        "Web search failed for query %r region=%s backend=%s",
+                        search_query, region, backend,
+                    )
+                    batch = []
+
+                for result in batch:
+                    raw_title = result.get("title", "").strip()
+                    raw_body = result.get("body", "").strip()
+                    context = f"{raw_title}. {raw_body}" if raw_title else raw_body
+                    if not is_relevant_result(query, search_query, normalize_text(context)):
+                        continue
+
+                    key = result.get("href") or result.get("title") or result.get("body")
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    result["_search_query"] = search_query
+                    results.append(result)
+                    if len(results) >= target_results:
+                        return results
+
+                if batch:
+                    break
+
+                if attempt + 1 < SEARCH_ATTEMPTS:
+                    time.sleep(0.25)
+
+    return results
+
 def web_qa(query, max_results: int = 10, timeout: int = 10):
     person_expected = expects_person(query)
+    winner_expected = expects_winner(query)
     predictions = []
 
     try:
-        with DDGS(timeout=timeout) as ddgs:
-            results = list(ddgs.text(
-                query,
-                region="in-en",
-                safesearch="Off",
-                backend="lite",
-                max_results=max_results
-            ))
+        results = search_web(query, max_results=max_results, timeout=timeout)
     except Exception:
         logger.exception("Web search failed")
         return None
 
     for r in results:
+        raw_title = r.get("title", "").strip()
         raw_body = r.get("body", "").strip()
         if len(raw_body.split()) < 6:
             continue
 
+        title = normalize_text(raw_title)
         body = normalize_text(raw_body)
+        context = f"{title}. {body}" if title else body
+        search_query = r.get("_search_query", query)
 
-        out = qa_model(question=query, context=body)
+        if not is_relevant_result(query, search_query, context):
+            continue
+
+        out = qa_model(question=query, context=context)
         answer = clean_answer(out["answer"])
 
         if not answer:
             continue
+        if is_truncated_answer(answer):
+            continue
         if is_generic_role_answer(answer, person_expected):
+            continue
+        if winner_expected and is_matchup_answer(answer):
+            continue
+        if winner_expected and not has_winner_evidence(answer, context):
             continue
 
         score = out["score"]
@@ -240,7 +421,7 @@ def web_qa(query, max_results: int = 10, timeout: int = 10):
         predictions.append({
             "answer": answer,
             "score": score,
-            "context": body,
+            "context": context,
             "source": r.get("href")
         })
 

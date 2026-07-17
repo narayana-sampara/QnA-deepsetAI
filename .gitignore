@@ -26,6 +26,7 @@ htmlcov/
 
 # ML model cache (downloaded at runtime)
 .cache/
+.hf-cache/
 hf_cache/
 
 # IDE
