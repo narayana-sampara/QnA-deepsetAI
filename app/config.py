@@ -7,6 +7,8 @@ def _split_csv(value: str) -> list[str]:
 
 class Settings:
     api_key: str = os.environ.get("QNA_API_KEY", "")
+    hf_token: str = os.environ.get("HF_TOKEN", "")
+    hf_qa_model: str = os.environ.get("HF_QA_MODEL", "deepset/roberta-base-squad2")
     allowed_origins: list[str] = _split_csv(os.environ.get("QNA_ALLOWED_ORIGINS", ""))
     allowed_hosts: list[str] = _split_csv(os.environ.get("QNA_ALLOWED_HOSTS", "*"))
     rate_limit: str = os.environ.get("QNA_RATE_LIMIT", "20/minute")

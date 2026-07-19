@@ -120,7 +120,7 @@ async def health():
 
 @app.get("/ready", include_in_schema=False)
 async def ready():
-    return {"status": "ready", "model_loaded": qna_core.qa_model is not None}
+    return {"status": "ready", "hf_token_configured": bool(settings.hf_token)}
 
 
 @app.post("/ask", response_model=AnswerResponse, dependencies=[Security(require_api_key)])

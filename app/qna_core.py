@@ -7,10 +7,12 @@ import operator
 import logging
 import time
 
-import torch
 from ddgs import DDGS
-from transformers import pipeline
+from huggingface_hub import InferenceClient
+from huggingface_hub.errors import HfHubHTTPError
 from rapidfuzz import process, fuzz
+
+from app.config import settings
 
 logger = logging.getLogger("qna.core")
 
@@ -27,16 +29,26 @@ SEARCH_RESULTS_PER_QUERY = 5
 MIN_RELEVANT_TERM_MATCHES = 2
 
 # ============================================================
-# Model Initialization
+# Model Initialization (Hugging Face Inference API — no local weights)
 # ============================================================
-device = "cuda" if torch.cuda.is_available() else "cpu"
-logger.info("Loading QA model on %s", device)
+QA_MODEL_NAME = settings.hf_qa_model
+if not settings.hf_token:
+    logger.warning("HF_TOKEN is not configured; Hugging Face Inference API calls will fail")
+logger.info("Using HF Inference API QA model %s", QA_MODEL_NAME)
 
-qa_model = pipeline(
-    "question-answering",
-    model="deepset/roberta-base-squad2",
-    device=0 if device == "cuda" else -1,
+_hf_client = InferenceClient(
+    provider="hf-inference",
+    api_key=settings.hf_token,
 )
+
+
+def qa_model(question: str, context: str) -> dict:
+    result = _hf_client.question_answering(
+        question=question,
+        context=context,
+        model=QA_MODEL_NAME,
+    )
+    return {"answer": result.answer, "score": result.score}
 
 # ============================================================
 # Question Type Detection
@@ -400,7 +412,11 @@ def web_qa(query, max_results: int = 10, timeout: int = 10):
         if not is_relevant_result(query, search_query, context):
             continue
 
-        out = qa_model(question=query, context=context)
+        try:
+            out = qa_model(question=query, context=context)
+        except HfHubHTTPError:
+            logger.exception("HF Inference API call failed for query %r", query)
+            continue
         answer = clean_answer(out["answer"])
 
         if not answer:

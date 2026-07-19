@@ -4,10 +4,6 @@ FROM python:3.11-slim AS builder
 
 WORKDIR /build
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential \
-    && rm -rf /var/lib/apt/lists/*
-
 COPY requirements.txt .
 RUN pip install --no-cache-dir --user -r requirements.txt
 
@@ -29,10 +25,7 @@ RUN chown -R appuser:appuser /app
 
 ENV PATH=/home/appuser/.local/bin:$PATH \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    HF_HOME=/tmp/hf_cache \
-    TRANSFORMERS_CACHE=/tmp/hf_cache \
-    XDG_CACHE_HOME=/tmp/.cache
+    PYTHONUNBUFFERED=1
 
 USER appuser
 

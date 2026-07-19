@@ -1,8 +1,8 @@
 # QnA API
 
-A FastAPI service that answers free-text questions by combining a local
-extractive question-answering model (`deepset/roberta-base-squad2`) with
-live web search results. It routes each question through specialized
+A FastAPI service that answers free-text questions by combining an
+extractive question-answering model (`deepset/roberta-base-squad2`, served
+via the Hugging Face Inference API) with live web search results. It routes each question through specialized
 handlers for arithmetic, yes/no claims, and general factual questions, then
 uses a fuzzy-matching consensus engine across multiple web snippets to pick
 the most reliable answer.
@@ -27,7 +27,7 @@ the most reliable answer.
 ```
 app/
   main.py        FastAPI app: middleware, auth, rate limiting, /ask endpoint
-  qna_core.py     Core QA/search/consensus logic and the loaded model pipeline
+  qna_core.py     Core QA/search/consensus logic and the HF Inference API client
   config.py       Environment-driven settings
 QnA_ai.py         Standalone CLI version of the same QA engine (for local testing)
 Dockerfile        Multi-stage build, runs as non-root user under gunicorn
@@ -62,7 +62,7 @@ Response:
 Liveness check, returns `{"status": "ok"}`.
 
 ### `GET /ready`
-Readiness check, returns whether the QA model has finished loading.
+Readiness check, returns whether `HF_TOKEN` is configured.
 
 ## Configuration
 
@@ -71,6 +71,8 @@ All configuration is via environment variables (see `.env.example`):
 | Variable | Description | Default |
 |---|---|---|
 | `QNA_API_KEY` | Required API key clients must send in `X-API-Key` | *(none — service refuses requests if unset)* |
+| `HF_TOKEN` | Required Hugging Face access token for the Inference API | *(none — QA calls fail if unset)* |
+| `HF_QA_MODEL` | HF model used for question answering | `deepset/roberta-base-squad2` |
 | `QNA_ALLOWED_ORIGINS` | Comma-separated CORS origins | *(empty)* |
 | `QNA_ALLOWED_HOSTS` | Comma-separated allowed `Host` headers | `*` |
 | `QNA_RATE_LIMIT` | slowapi rate limit expression | `20/minute` |
@@ -105,5 +107,6 @@ read-only root filesystem and no extra Linux capabilities.
 
 ## Notes
 
-- The QA model runs on GPU automatically if CUDA is available, otherwise CPU.
+- QA inference runs remotely via the Hugging Face Inference API — no local
+  model weights, GPU, or CPU inference cost.
 - API docs (`/docs`, `/redoc`, `/openapi.json`) are disabled in production.
