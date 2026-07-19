@@ -25,7 +25,9 @@ RUN chown -R appuser:appuser /app
 
 ENV PATH=/home/appuser/.local/bin:$PATH \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    HF_HOME=/tmp/hf_cache \
+    XDG_CACHE_HOME=/tmp/.cache
 
 USER appuser
 
